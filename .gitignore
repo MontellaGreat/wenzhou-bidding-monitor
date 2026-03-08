@@ -4,5 +4,9 @@
 # Track only selected project files
 !.gitignore
 !README.md
+!SESSION-STATE.md
 !scripts/
 !scripts/wenzhou_bidding_zhiliao.py
+!scripts/qmd-lite-search.py
+!docs/
+!docs/qmd-lite-alternative.md
