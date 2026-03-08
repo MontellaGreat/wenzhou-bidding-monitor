@@ -16,7 +16,7 @@ import re
 import sys
 from datetime import datetime, timedelta
 from html import unescape
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 import requests
 
@@ -36,10 +36,17 @@ DEFAULT_DETAIL_LIMIT = int(os.environ.get("ZLBX_DETAIL_LIMIT", "8"))
 NEGATIVE_HINTS = [
     "摄像头", "监控设备", "安防", "LED", "广播系统", "电视机", "电脑", "网络设备",
     "球场建设", "疗休养", "疗养项目", "职工疗养", "勘察设计", "工程设计", "施工", "排涝工程",
-    "绿道", "道路", "围墙", "开关柜", "断路器", "耗材", "空港大道", "基础配套设施", "设备采购"
+    "绿道", "道路", "围墙", "开关柜", "断路器", "耗材", "空港大道", "基础配套设施", "设备采购",
+    "建筑运营", "园艺植物", "生态绿道", "物业", "园林", "硬件"
 ]
-PREFERRED_HINTS = [
-    "宣传", "视频", "图文", "公众号", "新媒体", "活动", "拍摄", "制作", "运营", "策划", "美陈", "会务"
+STRONG_HINTS = [
+    "宣传片", "视频制作", "公众号", "新媒体", "图文", "拍摄", "会务", "会议策划", "美陈制作", "宣传部"
+]
+MEDIUM_HINTS = [
+    "宣传", "视频", "活动策划", "策划", "运营服务", "战略合作", "美陈", "文化活动", "会展"
+]
+WEAK_HINTS = [
+    "活动", "运营", "合作", "服务", "设计"
 ]
 
 SESSION = requests.Session()
@@ -191,20 +198,44 @@ def pick_agency_contact(agency: Any) -> str:
     return "暂无"
 
 
+def score_terms(hay: str) -> Tuple[int, str]:
+    score = 0
+    strong_hits = [w for w in STRONG_HINTS if w in hay]
+    medium_hits = [w for w in MEDIUM_HINTS if w in hay]
+    weak_hits = [w for w in WEAK_HINTS if w in hay]
+    negative_hits = [w for w in NEGATIVE_HINTS if w in hay]
+
+    score += len(strong_hits) * 6
+    score += len(medium_hits) * 3
+    score += len(weak_hits) * 1
+    score -= len(negative_hits) * 8
+
+    if strong_hits:
+        tier = "强相关"
+    elif medium_hits:
+        tier = "中相关"
+    elif weak_hits:
+        tier = "弱相关"
+    else:
+        tier = "无关"
+    return score, tier
+
+
 def compute_score(item: Dict[str, Any]) -> int:
     hay = join_keywords(item)
-    score = 0
-    for word in PREFERRED_HINTS:
-        if word in hay:
-            score += 2
-    for bad in NEGATIVE_HINTS:
-        if bad in hay:
-            score -= 6
+    score, _ = score_terms(hay)
     if item.get("callerContactPerson"):
         score += 2
     if normalize_money(item.get("money")) != "暂无":
         score += 1
+    if item.get("callerName") and any(x in (item.get("callerName") or "") for x in ["宣传部", "日报", "文旅", "体育", "传媒", "运营"]):
+        score += 2
     return score
+
+
+def relevance_tier(item: Dict[str, Any]) -> str:
+    _, tier = score_terms(join_keywords(item))
+    return tier
 
 
 def looks_relevant(item: Dict[str, Any]) -> bool:
@@ -213,9 +244,7 @@ def looks_relevant(item: Dict[str, Any]) -> bool:
         return False
     if any(bad in hay for bad in NEGATIVE_HINTS):
         return False
-    if not any(good in hay for good in PREFERRED_HINTS):
-        return False
-    return compute_score(item) >= 2
+    return relevance_tier(item) in ("强相关", "中相关") and compute_score(item) >= 3
 
 
 def merge_record(row: Dict[str, Any], detail: Dict[str, Any], content: Dict[str, Any]) -> Dict[str, str]:
@@ -223,24 +252,25 @@ def merge_record(row: Dict[str, Any], detail: Dict[str, Any], content: Dict[str,
     agency_contact = pick_agency_contact(detail.get("agency") or row.get("agency"))
     merged_contact = caller_contact if caller_contact != "暂无" else agency_contact
     address = extract_address(content.get("content", "")) if content else "暂无"
-
+    base = detail or row
     return {
-        "公告名称": detail.get("title") or row.get("title") or "暂无",
-        "采购单位": detail.get("callerName") or row.get("callerName") or "暂无",
-        "项目编号": detail.get("bidNo") or row.get("bidNo") or "暂无",
-        "发布时间": detail.get("pubTime") or row.get("pubTime") or "暂无",
-        "项目金额（预算）": normalize_money(detail.get("money") or row.get("money")),
+        "相关度": relevance_tier(base),
+        "公告名称": base.get("title") or row.get("title") or "暂无",
+        "采购单位": base.get("callerName") or row.get("callerName") or "暂无",
+        "项目编号": base.get("bidNo") or row.get("bidNo") or "暂无",
+        "发布时间": base.get("pubTime") or row.get("pubTime") or "暂无",
+        "项目金额（预算）": normalize_money(base.get("money") or row.get("money")),
         "地址": address,
         "联系方式": merged_contact,
-        "uniqKey": detail.get("uniqKey") or row.get("uniqKey") or "",
-        "sourceUrl": (content or {}).get("sourceUrl", "") or detail.get("zlBidDetailLink") or row.get("zlBidDetailLink") or "",
+        "uniqKey": base.get("uniqKey") or row.get("uniqKey") or "",
+        "sourceUrl": (content or {}).get("sourceUrl", "") or base.get("zlBidDetailLink") or row.get("zlBidDetailLink") or "",
     }
 
 
 def build_records(days: int = DEFAULT_DAYS, limit: int = DEFAULT_LIMIT, detail_limit: int = DEFAULT_DETAIL_LIMIT) -> List[Dict[str, str]]:
     rows = search_bids(days=days, limit=limit)
     rows = [r for r in rows if looks_relevant(r)]
-    rows.sort(key=compute_score, reverse=True)
+    rows.sort(key=lambda x: (relevance_tier(x) != "强相关", -compute_score(x), x.get("pubTime", "")), reverse=False)
     seen = set()
     filtered = []
     for row in rows:
@@ -278,7 +308,7 @@ def format_records(records: List[Dict[str, str]]) -> str:
     for idx, r in enumerate(records, 1):
         parts.extend([
             "",
-            f"{idx}.",
+            f"{idx}. [{r['相关度']}]",
             f"公告名称: {r['公告名称']}",
             f"采购单位: {r['采购单位']}",
             f"项目编号: {r['项目编号']}",
