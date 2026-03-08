@@ -6,8 +6,8 @@
 当前实现：
 1. 通过 v2 按产品关键词（含高级字段）做主检索
 2. 通过 v2 单个标讯（含高级字段）做精修补全
-3. 通过 v1 标讯正文兜底补地址
-4. 输出为用户指定的简洁格式
+3. 通过 v1 标讯正文兜底补地址 / 联系方式 / 预算
+4. 对“政府采购意向”做单独标识
 """
 
 import json
@@ -43,7 +43,7 @@ STRONG_HINTS = [
     "宣传片", "视频制作", "公众号", "新媒体", "图文", "拍摄", "会务", "会议策划", "美陈制作", "宣传部"
 ]
 MEDIUM_HINTS = [
-    "宣传", "视频", "活动策划", "策划", "运营服务", "战略合作", "美陈", "文化活动", "会展"
+    "宣传", "视频", "活动策划", "策划", "运营服务", "战略合作", "美陈", "文化活动", "会展", "公益电影"
 ]
 WEAK_HINTS = [
     "活动", "运营", "合作", "服务", "设计"
@@ -145,7 +145,22 @@ def extract_address(html: str) -> str:
         r"开标地点[：: ]+([^\n]{4,80})",
         r"项目地点[：: ]+([^\n]{4,80})",
         r"递交地点[：: ]+([^\n]{4,80})",
+        r"地址[：: ]+([^\n]{4,80})",
     ], text)
+
+
+def extract_budget_from_text(html: str) -> str:
+    text = strip_html(html)
+    candidates = [
+        extract_first([r"预算金额[（(]元[）)]?[：: ]+([0-9,.]+)"], text),
+        extract_first([r"预算金额[：: ]+([0-9,.]+万元)"], text),
+        extract_first([r"预算金额[：: ]+([0-9,.]+)"], text),
+        extract_first([r"拟采购的货物或服务的预算总金额[（(]元[）)]?[：: ]+([0-9,.]+)"], text),
+    ]
+    for c in candidates:
+        if c != "暂无":
+            return c
+    return "暂无"
 
 
 def normalize_money(value: Any) -> str:
@@ -238,6 +253,21 @@ def relevance_tier(item: Dict[str, Any]) -> str:
     return tier
 
 
+def detect_notice_type(title: str, source_text: str) -> str:
+    hay = f"{title} {source_text}"
+    if "采购意向" in hay:
+        return "采购意向"
+    if "单一来源" in hay:
+        return "单一来源"
+    if "变更公告" in hay:
+        return "变更公告"
+    if "招标" in hay or "采购公告" in hay or "资格预审" in hay or "公告" in title:
+        return "招标公告"
+    if "中标" in hay or "成交" in hay:
+        return "中标/成交"
+    return "其他"
+
+
 def looks_relevant(item: Dict[str, Any]) -> bool:
     hay = join_keywords(item)
     if not any(k in hay for k in SEARCH_TERMS):
@@ -251,15 +281,23 @@ def merge_record(row: Dict[str, Any], detail: Dict[str, Any], content: Dict[str,
     caller_contact = pick_first_phone(detail.get("callerContactPerson") or row.get("callerContactPerson"))
     agency_contact = pick_agency_contact(detail.get("agency") or row.get("agency"))
     merged_contact = caller_contact if caller_contact != "暂无" else agency_contact
-    address = extract_address(content.get("content", "")) if content else "暂无"
+    html = (content or {}).get("content", "")
+    address = extract_address(html) if html else "暂无"
+    budget_fallback = extract_budget_from_text(html) if html else "暂无"
     base = detail or row
+    notice_type = detect_notice_type(base.get("title", ""), strip_html(html)[:1200] if html else "")
+    money = normalize_money(base.get("money") or row.get("money"))
+    if money == "暂无" and budget_fallback != "暂无":
+        money = budget_fallback
+
     return {
         "相关度": relevance_tier(base),
+        "公告类型": notice_type,
         "公告名称": base.get("title") or row.get("title") or "暂无",
         "采购单位": base.get("callerName") or row.get("callerName") or "暂无",
-        "项目编号": base.get("bidNo") or row.get("bidNo") or "暂无",
+        "项目编号": base.get("bidNo") or row.get("bidNo") or ("采购意向无正式编号" if notice_type == "采购意向" else "暂无"),
         "发布时间": base.get("pubTime") or row.get("pubTime") or "暂无",
-        "项目金额（预算）": normalize_money(base.get("money") or row.get("money")),
+        "项目金额（预算）": money,
         "地址": address,
         "联系方式": merged_contact,
         "uniqKey": base.get("uniqKey") or row.get("uniqKey") or "",
@@ -308,7 +346,7 @@ def format_records(records: List[Dict[str, str]]) -> str:
     for idx, r in enumerate(records, 1):
         parts.extend([
             "",
-            f"{idx}. [{r['相关度']}]",
+            f"{idx}. [{r['相关度']} / {r['公告类型']}]",
             f"公告名称: {r['公告名称']}",
             f"采购单位: {r['采购单位']}",
             f"项目编号: {r['项目编号']}",
