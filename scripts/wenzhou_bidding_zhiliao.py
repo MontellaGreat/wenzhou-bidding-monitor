@@ -9,6 +9,7 @@
 3. 通过 v1 标讯正文兜底补地址 / 联系方式 / 预算
 4. 对“政府采购意向”做单独标识
 5. 联系人与电话号码分字段输出
+6. 对字段缺失较多的记录自动降权
 """
 
 import json
@@ -278,6 +279,16 @@ def detect_notice_type(title: str, source_text: str) -> str:
     return "其他"
 
 
+def missing_fields_penalty(record: Dict[str, str]) -> int:
+    penalty = 0
+    for key in ["地址", "联系人", "联系方式"]:
+        if record.get(key) == "暂无":
+            penalty += 1
+    if record.get("项目编号") in ("暂无", "采购意向无正式编号"):
+        penalty += 1
+    return penalty
+
+
 def looks_relevant(item: Dict[str, Any]) -> bool:
     hay = join_keywords(item)
     if not any(k in hay for k in SEARCH_TERMS):
@@ -307,7 +318,7 @@ def merge_record(row: Dict[str, Any], detail: Dict[str, Any], content: Dict[str,
     if money == "暂无" and budget_fallback != "暂无":
         money = budget_fallback
 
-    return {
+    record = {
         "相关度": relevance_tier(base),
         "公告类型": notice_type,
         "公告名称": base.get("title") or row.get("title") or "暂无",
@@ -321,6 +332,8 @@ def merge_record(row: Dict[str, Any], detail: Dict[str, Any], content: Dict[str,
         "uniqKey": base.get("uniqKey") or row.get("uniqKey") or "",
         "sourceUrl": (content or {}).get("sourceUrl", "") or base.get("zlBidDetailLink") or row.get("zlBidDetailLink") or "",
     }
+    record["缺失项数"] = str(missing_fields_penalty(record))
+    return record
 
 
 def build_records(days: int = DEFAULT_DAYS, limit: int = DEFAULT_LIMIT, detail_limit: int = DEFAULT_DETAIL_LIMIT) -> List[Dict[str, str]]:
@@ -336,7 +349,7 @@ def build_records(days: int = DEFAULT_DAYS, limit: int = DEFAULT_LIMIT, detail_l
             filtered.append(row)
 
     records = []
-    for row in filtered[:detail_limit]:
+    for row in filtered[:detail_limit * 2]:
         uniq = row.get("uniqKey", "")
         detail = row
         try:
@@ -349,7 +362,9 @@ def build_records(days: int = DEFAULT_DAYS, limit: int = DEFAULT_LIMIT, detail_l
         except Exception:
             content = {}
         records.append(merge_record(row, detail, content))
-    return records
+
+    records.sort(key=lambda r: (r["相关度"] != "强相关", int(r["缺失项数"]), r["公告类型"] == "采购意向", r["发布时间"]), reverse=False)
+    return records[:detail_limit]
 
 
 def format_records(records: List[Dict[str, str]]) -> str:
