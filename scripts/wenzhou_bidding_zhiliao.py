@@ -4,9 +4,9 @@
 温州招标监控（知了标讯 API 版）
 
 当前实现：
-1. 通过知了标讯开放平台调试沙箱接口检索候选公告
-2. 通过“单个标讯(含高级字段)”接口补全结构化字段
-3. 通过“标讯正文”接口兜底补地址和联系方式
+1. 通过 v2 按产品关键词（含高级字段）做主检索
+2. 通过 v2 单个标讯（含高级字段）做精修补全
+3. 通过 v1 标讯正文兜底补地址
 4. 输出为用户指定的简洁格式
 """
 
@@ -25,19 +25,21 @@ APP_ID = os.environ.get("ZLBX_APP_ID", "202603081480343542189522944")
 APP_SECRET = os.environ.get("ZLBX_APP_SECRET", "dbb6bb44741c4066a4025e284145fce0")
 ZLBX_TOKEN = os.environ.get("ZLBX_TOKEN", "")
 
-KEYWORDS = ["活动", "图文", "公众号", "视频制作", "宣传片"]
+DISPLAY_KEYWORDS = ["活动", "图文", "公众号", "视频制作", "宣传片"]
+SEARCH_TERMS = ["活动", "图文", "公众号", "视频制作", "宣传片", "宣传", "拍摄", "新媒体", "运营", "策划", "美陈"]
 PROVINCE = "浙江"
 CITY = "温州"
-DEFAULT_DAYS = int(os.environ.get("ZLBX_DAYS", "3"))
-DEFAULT_LIMIT = int(os.environ.get("ZLBX_LIMIT", "20"))
+DEFAULT_DAYS = int(os.environ.get("ZLBX_DAYS", "7"))
+DEFAULT_LIMIT = int(os.environ.get("ZLBX_LIMIT", "30"))
 DEFAULT_DETAIL_LIMIT = int(os.environ.get("ZLBX_DETAIL_LIMIT", "8"))
 
 NEGATIVE_HINTS = [
     "摄像头", "监控设备", "安防", "LED", "广播系统", "电视机", "电脑", "网络设备",
-    "球场建设", "疗休养", "疗养项目", "职工疗养"
+    "球场建设", "疗休养", "疗养项目", "职工疗养", "勘察设计", "工程设计", "施工", "排涝工程",
+    "绿道", "道路", "围墙", "开关柜", "断路器", "耗材", "空港大道", "基础配套设施", "设备采购"
 ]
 PREFERRED_HINTS = [
-    "宣传", "视频", "图文", "公众号", "新媒体", "活动", "拍摄", "制作", "运营", "设计"
+    "宣传", "视频", "图文", "公众号", "新媒体", "活动", "拍摄", "制作", "运营", "策划", "美陈", "会务"
 ]
 
 SESSION = requests.Session()
@@ -82,7 +84,7 @@ def search_bids(days: int = DEFAULT_DAYS, limit: int = DEFAULT_LIMIT) -> List[Di
     end_date = datetime.now()
     start_date = end_date - timedelta(days=days)
     biz = {
-        "subjectMatter": ",".join(KEYWORDS),
+        "subjectMatter": ",".join(SEARCH_TERMS),
         "province": PROVINCE,
         "city": CITY,
         "startTime": start_date.strftime("%Y-%m-%d"),
@@ -92,7 +94,7 @@ def search_bids(days: int = DEFAULT_DAYS, limit: int = DEFAULT_LIMIT) -> List[Di
         "page": 1,
         "limit": limit,
     }
-    result = sandbox_call("v1.api.subject.matter.bid.free.get", biz)
+    result = sandbox_call("v2.api.subject.matter.bid.get", biz)
     return result.get("data", [])
 
 
@@ -128,38 +130,34 @@ def extract_first(patterns: List[str], text: str, flags=re.I) -> str:
     return "暂无"
 
 
-def extract_contact_info(html: str) -> Dict[str, str]:
+def extract_address(html: str) -> str:
     text = strip_html(html)
-    address = extract_first([
+    return extract_first([
         r"(?:采购人|采购单位)?地\s*址[：: ]+([^\n]{4,80})",
         r"联系地址[：: ]+([^\n]{4,80})",
         r"开标地点[：: ]+([^\n]{4,80})",
         r"项目地点[：: ]+([^\n]{4,80})",
+        r"递交地点[：: ]+([^\n]{4,80})",
     ], text)
-    phone = extract_first([
-        r"联系方式[：: ]+([0-9\-]{7,20})",
-        r"联系电话[：: ]+([0-9\-]{7,20})",
-        r"电\s*话[：: ]+([0-9\-]{7,20})",
-        r"项目联系人[\s\S]{0,20}?([0-9\-]{7,20})",
-    ], text)
-    person = extract_first([
-        r"项目联系人[：: ]+([^\n：:]{1,20})",
-        r"联\s*系\s*人[：: ]+([^\n：:]{1,20})",
-    ], text)
-    if phone != "暂无" and person != "暂无":
-        contact = f"{person} {phone}"
-    elif phone != "暂无":
-        contact = phone
-    else:
-        contact = person
-    return {"address": address, "contact": contact or "暂无", "text": text}
 
 
 def normalize_money(value: Any) -> str:
     if value in (None, "", [], {}):
         return "暂无"
     s = str(value).strip()
+    if s == "0":
+        return "暂无"
     return s or "暂无"
+
+
+def join_keywords(row: Dict[str, Any]) -> str:
+    return " ".join([
+        row.get("title", "") or "",
+        row.get("projectName", "") or "",
+        " ".join(row.get("smNames", []) or []),
+        " ".join(row.get("matchedKeywords", []) or []),
+        row.get("callerName", "") or "",
+    ])
 
 
 def pick_first_phone(items: Any) -> str:
@@ -183,8 +181,7 @@ def pick_agency_contact(agency: Any) -> str:
             if not isinstance(item, dict):
                 continue
             agency_name = str(item.get("agencyName", "")).strip()
-            persons = item.get("agencyContactPerson", [])
-            person = pick_first_phone(persons)
+            person = pick_first_phone(item.get("agencyContactPerson", []))
             if agency_name and person != "暂无":
                 return f"{agency_name} / {person}"
             if person != "暂无":
@@ -195,45 +192,37 @@ def pick_agency_contact(agency: Any) -> str:
 
 
 def compute_score(item: Dict[str, Any]) -> int:
-    hay = " ".join([
-        item.get("title", "") or "",
-        " ".join(item.get("smNames", []) or []),
-        " ".join(item.get("matchedKeywords", []) or []),
-    ])
+    hay = join_keywords(item)
     score = 0
     for word in PREFERRED_HINTS:
         if word in hay:
             score += 2
     for bad in NEGATIVE_HINTS:
         if bad in hay:
-            score -= 5
+            score -= 6
+    if item.get("callerContactPerson"):
+        score += 2
+    if normalize_money(item.get("money")) != "暂无":
+        score += 1
     return score
 
 
 def looks_relevant(item: Dict[str, Any]) -> bool:
-    hay = " ".join([
-        item.get("title", "") or "",
-        " ".join(item.get("smNames", []) or []),
-        " ".join(item.get("matchedKeywords", []) or []),
-    ])
-    if not any(k in hay for k in KEYWORDS):
+    hay = join_keywords(item)
+    if not any(k in hay for k in SEARCH_TERMS):
         return False
     if any(bad in hay for bad in NEGATIVE_HINTS):
+        return False
+    if not any(good in hay for good in PREFERRED_HINTS):
         return False
     return compute_score(item) >= 2
 
 
 def merge_record(row: Dict[str, Any], detail: Dict[str, Any], content: Dict[str, Any]) -> Dict[str, str]:
-    html = content.get("content", "") if content else ""
-    extracted = extract_contact_info(html) if html else {"address": "暂无", "contact": "暂无"}
-
-    caller_contact = pick_first_phone(detail.get("callerContactPerson"))
-    agency_contact = pick_agency_contact(detail.get("agency"))
+    caller_contact = pick_first_phone(detail.get("callerContactPerson") or row.get("callerContactPerson"))
+    agency_contact = pick_agency_contact(detail.get("agency") or row.get("agency"))
     merged_contact = caller_contact if caller_contact != "暂无" else agency_contact
-    if merged_contact == "暂无":
-        merged_contact = extracted.get("contact", "暂无")
-
-    address = extracted.get("address", "暂无")
+    address = extract_address(content.get("content", "")) if content else "暂无"
 
     return {
         "公告名称": detail.get("title") or row.get("title") or "暂无",
@@ -244,7 +233,7 @@ def merge_record(row: Dict[str, Any], detail: Dict[str, Any], content: Dict[str,
         "地址": address,
         "联系方式": merged_contact,
         "uniqKey": detail.get("uniqKey") or row.get("uniqKey") or "",
-        "sourceUrl": content.get("sourceUrl", "") if content else "",
+        "sourceUrl": (content or {}).get("sourceUrl", "") or detail.get("zlBidDetailLink") or row.get("zlBidDetailLink") or "",
     }
 
 
@@ -263,15 +252,14 @@ def build_records(days: int = DEFAULT_DAYS, limit: int = DEFAULT_LIMIT, detail_l
     records = []
     for row in filtered[:detail_limit]:
         uniq = row.get("uniqKey", "")
-        detail = {}
+        detail = row
+        try:
+            detail = get_bid_detail(uniq) if uniq else row
+        except Exception:
+            detail = row
         content = {}
         try:
-            detail = get_bid_detail(uniq) if uniq else {}
-        except Exception:
-            detail = {}
-        try:
-            need_fallback = not detail.get("callerContactPerson")
-            content = get_bid_content(uniq) if uniq and need_fallback else {}
+            content = get_bid_content(uniq) if uniq else {}
         except Exception:
             content = {}
         records.append(merge_record(row, detail, content))
@@ -283,7 +271,7 @@ def format_records(records: List[Dict[str, str]]) -> str:
         return (
             "温州招标监控（知了标讯）\n"
             "本次未发现符合关键词的公告。\n"
-            f"关键词：{','.join(KEYWORDS)}\n"
+            f"关键词：{','.join(DISPLAY_KEYWORDS)}\n"
             f"地区：{PROVINCE} / {CITY}"
         )
     parts = ["温州招标监控（知了标讯）"]
