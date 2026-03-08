@@ -8,6 +8,7 @@
 2. 通过 v2 单个标讯（含高级字段）做精修补全
 3. 通过 v1 标讯正文兜底补地址 / 联系方式 / 预算
 4. 对“政府采购意向”做单独标识
+5. 联系人与电话号码分字段输出
 """
 
 import json
@@ -163,6 +164,21 @@ def extract_budget_from_text(html: str) -> str:
     return "暂无"
 
 
+def extract_contact_from_text(html: str) -> Dict[str, str]:
+    text = strip_html(html)
+    person = extract_first([
+        r"项目联系人[：: ]+([^\n：:]{1,20})",
+        r"联\s*系\s*人[：: ]+([^\n：:]{1,20})",
+        r"联系人[：: ]+([^\n：:]{1,20})",
+    ], text)
+    phone = extract_first([
+        r"联系方式[：: ]+([0-9\-]{7,20})",
+        r"联系电话[：: ]+([0-9\-]{7,20})",
+        r"电\s*话[：: ]+([0-9\-]{7,20})",
+    ], text)
+    return {"person": person, "phone": phone}
+
+
 def normalize_money(value: Any) -> str:
     if value in (None, "", [], {}):
         return "暂无"
@@ -182,35 +198,29 @@ def join_keywords(row: Dict[str, Any]) -> str:
     ])
 
 
-def pick_first_phone(items: Any) -> str:
+def pick_person_phone(items: Any) -> Dict[str, str]:
     if isinstance(items, list):
         for item in items:
             if isinstance(item, dict):
-                name = str(item.get("name", "")).strip()
-                phone = str(item.get("phone", "")).strip()
-                if phone and name:
-                    return f"{name} {phone}"
-                if phone:
-                    return phone
-                if name:
-                    return name
-    return "暂无"
+                name = str(item.get("name", "")).strip() or "暂无"
+                phone = str(item.get("phone", "")).strip() or "暂无"
+                if name != "暂无" or phone != "暂无":
+                    return {"person": name, "phone": phone}
+    return {"person": "暂无", "phone": "暂无"}
 
 
-def pick_agency_contact(agency: Any) -> str:
+def pick_agency_contact(agency: Any) -> Dict[str, str]:
     if isinstance(agency, list):
         for item in agency:
             if not isinstance(item, dict):
                 continue
-            agency_name = str(item.get("agencyName", "")).strip()
-            person = pick_first_phone(item.get("agencyContactPerson", []))
-            if agency_name and person != "暂无":
-                return f"{agency_name} / {person}"
-            if person != "暂无":
-                return person
-            if agency_name:
-                return agency_name
-    return "暂无"
+            persons = pick_person_phone(item.get("agencyContactPerson", []))
+            agency_name = str(item.get("agencyName", "")).strip() or "暂无"
+            if persons["person"] != "暂无" or persons["phone"] != "暂无":
+                return persons
+            if agency_name != "暂无":
+                return {"person": agency_name, "phone": "暂无"}
+    return {"person": "暂无", "phone": "暂无"}
 
 
 def score_terms(hay: str) -> Tuple[int, str]:
@@ -278,10 +288,17 @@ def looks_relevant(item: Dict[str, Any]) -> bool:
 
 
 def merge_record(row: Dict[str, Any], detail: Dict[str, Any], content: Dict[str, Any]) -> Dict[str, str]:
-    caller_contact = pick_first_phone(detail.get("callerContactPerson") or row.get("callerContactPerson"))
+    caller_contact = pick_person_phone(detail.get("callerContactPerson") or row.get("callerContactPerson"))
     agency_contact = pick_agency_contact(detail.get("agency") or row.get("agency"))
-    merged_contact = caller_contact if caller_contact != "暂无" else agency_contact
     html = (content or {}).get("content", "")
+    text_contact = extract_contact_from_text(html) if html else {"person": "暂无", "phone": "暂无"}
+
+    chosen = caller_contact
+    if chosen["person"] == "暂无" and chosen["phone"] == "暂无":
+        chosen = agency_contact
+    if chosen["person"] == "暂无" and chosen["phone"] == "暂无":
+        chosen = text_contact
+
     address = extract_address(html) if html else "暂无"
     budget_fallback = extract_budget_from_text(html) if html else "暂无"
     base = detail or row
@@ -299,7 +316,8 @@ def merge_record(row: Dict[str, Any], detail: Dict[str, Any], content: Dict[str,
         "发布时间": base.get("pubTime") or row.get("pubTime") or "暂无",
         "项目金额（预算）": money,
         "地址": address,
-        "联系方式": merged_contact,
+        "联系人": chosen["person"],
+        "联系方式": chosen["phone"],
         "uniqKey": base.get("uniqKey") or row.get("uniqKey") or "",
         "sourceUrl": (content or {}).get("sourceUrl", "") or base.get("zlBidDetailLink") or row.get("zlBidDetailLink") or "",
     }
@@ -353,6 +371,7 @@ def format_records(records: List[Dict[str, str]]) -> str:
             f"发布时间: {r['发布时间']}",
             f"项目金额（预算）: {r['项目金额（预算）']}",
             f"地址：{r['地址']}",
+            f"联系人：{r['联系人']}",
             f"联系方式：{r['联系方式']}",
         ])
     return "\n".join(parts)
