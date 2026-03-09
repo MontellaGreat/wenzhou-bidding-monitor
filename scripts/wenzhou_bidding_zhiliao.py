@@ -6,7 +6,7 @@
 当前实现：
 1. 通过 v2 按产品关键词（含高级字段）做主检索
 2. 通过 v2 单个标讯（含高级字段）做精修补全
-3. 通过 v1 标讯正文兜底补地址 / 联系方式 / 预算
+3. 缺失字段统一输出为 null，不再调用正文兜底接口
 4. 对“政府采购意向”做单独标识
 5. 联系人与电话号码分字段输出
 6. 对字段缺失较多的记录自动降权
@@ -33,7 +33,7 @@ PROVINCE = "浙江"
 CITY = "温州"
 DEFAULT_DAYS = int(os.environ.get("ZLBX_DAYS", "7"))
 DEFAULT_LIMIT = int(os.environ.get("ZLBX_LIMIT", "30"))
-DEFAULT_DETAIL_LIMIT = int(os.environ.get("ZLBX_DETAIL_LIMIT", "8"))
+DEFAULT_DETAIL_LIMIT = int(os.environ.get("ZLBX_DETAIL_LIMIT", "12"))
 
 NEGATIVE_HINTS = [
     "摄像头", "监控设备", "安防", "LED", "广播系统", "电视机", "电脑", "网络设备",
@@ -180,13 +180,20 @@ def extract_contact_from_text(html: str) -> Dict[str, str]:
     return {"person": person, "phone": phone}
 
 
+def nullify(value: Any) -> str:
+    if value in (None, "", [], {}, "暂无"):
+        return "null"
+    s = str(value).strip()
+    return s if s else "null"
+
+
 def normalize_money(value: Any) -> str:
     if value in (None, "", [], {}):
-        return "暂无"
+        return "null"
     s = str(value).strip()
     if s == "0":
-        return "暂无"
-    return s or "暂无"
+        return "null"
+    return s or "null"
 
 
 def join_keywords(row: Dict[str, Any]) -> str:
@@ -282,9 +289,9 @@ def detect_notice_type(title: str, source_text: str) -> str:
 def missing_fields_penalty(record: Dict[str, str]) -> int:
     penalty = 0
     for key in ["地址", "联系人", "联系方式"]:
-        if record.get(key) == "暂无":
+        if record.get(key) == "null":
             penalty += 1
-    if record.get("项目编号") in ("暂无", "采购意向无正式编号"):
+    if record.get("项目编号") in ("null", "采购意向无正式编号"):
         penalty += 1
     return penalty
 
@@ -298,39 +305,31 @@ def looks_relevant(item: Dict[str, Any]) -> bool:
     return relevance_tier(item) in ("强相关", "中相关") and compute_score(item) >= 3
 
 
-def merge_record(row: Dict[str, Any], detail: Dict[str, Any], content: Dict[str, Any]) -> Dict[str, str]:
-    caller_contact = pick_person_phone(detail.get("callerContactPerson") or row.get("callerContactPerson"))
-    agency_contact = pick_agency_contact(detail.get("agency") or row.get("agency"))
-    html = (content or {}).get("content", "")
-    text_contact = extract_contact_from_text(html) if html else {"person": "暂无", "phone": "暂无"}
+def merge_record(row: Dict[str, Any], detail: Dict[str, Any]) -> Dict[str, str]:
+    base = detail or row
+    caller_contact = pick_person_phone(base.get("callerContactPerson") or row.get("callerContactPerson"))
+    agency_contact = pick_agency_contact(base.get("agency") or row.get("agency"))
 
     chosen = caller_contact
     if chosen["person"] == "暂无" and chosen["phone"] == "暂无":
         chosen = agency_contact
-    if chosen["person"] == "暂无" and chosen["phone"] == "暂无":
-        chosen = text_contact
 
-    address = extract_address(html) if html else "暂无"
-    budget_fallback = extract_budget_from_text(html) if html else "暂无"
-    base = detail or row
-    notice_type = detect_notice_type(base.get("title", ""), strip_html(html)[:1200] if html else "")
+    notice_type = detect_notice_type(base.get("title", ""), "")
     money = normalize_money(base.get("money") or row.get("money"))
-    if money == "暂无" and budget_fallback != "暂无":
-        money = budget_fallback
 
     record = {
         "相关度": relevance_tier(base),
         "公告类型": notice_type,
-        "公告名称": base.get("title") or row.get("title") or "暂无",
-        "采购单位": base.get("callerName") or row.get("callerName") or "暂无",
-        "项目编号": base.get("bidNo") or row.get("bidNo") or ("采购意向无正式编号" if notice_type == "采购意向" else "暂无"),
-        "发布时间": base.get("pubTime") or row.get("pubTime") or "暂无",
+        "公告名称": nullify(base.get("title") or row.get("title")),
+        "采购单位": nullify(base.get("callerName") or row.get("callerName")),
+        "项目编号": nullify(base.get("bidNo") or row.get("bidNo") or ("采购意向无正式编号" if notice_type == "采购意向" else None)),
+        "发布时间": nullify(base.get("pubTime") or row.get("pubTime")),
         "项目金额（预算）": money,
-        "地址": address,
-        "联系人": chosen["person"],
-        "联系方式": chosen["phone"],
+        "地址": "null",
+        "联系人": nullify(chosen["person"]),
+        "联系方式": nullify(chosen["phone"]),
         "uniqKey": base.get("uniqKey") or row.get("uniqKey") or "",
-        "sourceUrl": (content or {}).get("sourceUrl", "") or base.get("zlBidDetailLink") or row.get("zlBidDetailLink") or "",
+        "sourceUrl": nullify(base.get("zlBidDetailLink") or row.get("zlBidDetailLink") or ""),
     }
     record["缺失项数"] = str(missing_fields_penalty(record))
     return record
@@ -357,11 +356,7 @@ def build_records(days: int = DEFAULT_DAYS, limit: int = DEFAULT_LIMIT, detail_l
         except Exception:
             detail = row
         content = {}
-        try:
-            content = get_bid_content(uniq) if uniq else {}
-        except Exception:
-            content = {}
-        records.append(merge_record(row, detail, content))
+        records.append(merge_record(row, detail))
 
     records.sort(key=lambda r: (r["相关度"] != "强相关", int(r["缺失项数"]), r["公告类型"] == "采购意向", r["发布时间"]), reverse=False)
     return records[:detail_limit]
@@ -388,6 +383,7 @@ def format_records(records: List[Dict[str, str]]) -> str:
             f"地址：{r['地址']}",
             f"联系人：{r['联系人']}",
             f"联系方式：{r['联系方式']}",
+            f"详情链接：{r['sourceUrl'] or '暂无'}",
         ])
     return "\n".join(parts)
 
