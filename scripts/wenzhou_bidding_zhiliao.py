@@ -5,8 +5,8 @@
 
 当前实现：
 1. 通过 v2 按产品关键词（含高级字段）做主检索
-2. 通过 v2 单个标讯（含高级字段）做精修补全
-3. 缺失字段统一输出为 null，不再调用正文兜底接口
+2. 通过 v1 标讯正文接口做单条补全
+3. 从正文内容中提取地址、联系人、预算、原文链接
 4. 对“政府采购意向”做单独标识
 5. 联系人与电话号码分字段输出
 6. 对字段缺失较多的记录自动降权
@@ -115,6 +115,28 @@ def get_bid_detail(uniq_key: str) -> Dict[str, Any]:
 def get_bid_content(uniq_key: str) -> Dict[str, Any]:
     result = sandbox_call("v1.api.content.bid.get", {"uniqKey": uniq_key, "strictUri": 0})
     return result.get("data", {})
+
+
+def extract_origin_url(content: Dict[str, Any]) -> str:
+    if not isinstance(content, dict):
+        return "暂无"
+
+    candidate_keys = [
+        "sourceUrl", "originUrl", "originalUrl", "url", "href", "uri", "strictUri", "link"
+    ]
+    for key in candidate_keys:
+        value = content.get(key)
+        if isinstance(value, str) and value.strip().startswith(("http://", "https://")):
+            return value.strip()
+
+    for key in ["content", "html", "body", "text"]:
+        value = content.get(key)
+        if isinstance(value, str):
+            m = re.search(r'https?://[^\s"\'<>]+', value)
+            if m:
+                return m.group(0)
+
+    return "暂无"
 
 
 def strip_html(html: str) -> str:
@@ -305,17 +327,33 @@ def looks_relevant(item: Dict[str, Any]) -> bool:
     return relevance_tier(item) in ("强相关", "中相关") and compute_score(item) >= 3
 
 
-def merge_record(row: Dict[str, Any], detail: Dict[str, Any]) -> Dict[str, str]:
-    base = detail or row
+def merge_record(row: Dict[str, Any], content: Dict[str, Any]) -> Dict[str, str]:
+    base = row
+    content_html = ""
+    for key in ["content", "html", "body", "text"]:
+        value = content.get(key) if isinstance(content, dict) else None
+        if isinstance(value, str) and value.strip():
+            content_html = value
+            break
+
     caller_contact = pick_person_phone(base.get("callerContactPerson") or row.get("callerContactPerson"))
     agency_contact = pick_agency_contact(base.get("agency") or row.get("agency"))
+    text_contact = extract_contact_from_text(content_html) if content_html else {"person": "暂无", "phone": "暂无"}
 
     chosen = caller_contact
     if chosen["person"] == "暂无" and chosen["phone"] == "暂无":
         chosen = agency_contact
+    if chosen["person"] == "暂无" and chosen["phone"] == "暂无":
+        chosen = text_contact
 
-    notice_type = detect_notice_type(base.get("title", ""), "")
+    notice_type = detect_notice_type(base.get("title", ""), strip_html(content_html) if content_html else "")
     money = normalize_money(base.get("money") or row.get("money"))
+    if money == "null" and content_html:
+        money = nullify(extract_budget_from_text(content_html))
+
+    address = "null"
+    if content_html:
+        address = nullify(extract_address(content_html))
 
     record = {
         "相关度": relevance_tier(base),
@@ -325,11 +363,12 @@ def merge_record(row: Dict[str, Any], detail: Dict[str, Any]) -> Dict[str, str]:
         "项目编号": nullify(base.get("bidNo") or row.get("bidNo") or ("采购意向无正式编号" if notice_type == "采购意向" else None)),
         "发布时间": nullify(base.get("pubTime") or row.get("pubTime")),
         "项目金额（预算）": money,
-        "地址": "null",
+        "地址": address,
         "联系人": nullify(chosen["person"]),
         "联系方式": nullify(chosen["phone"]),
         "uniqKey": base.get("uniqKey") or row.get("uniqKey") or "",
-        "sourceUrl": nullify(base.get("zlBidDetailLink") or row.get("zlBidDetailLink") or ""),
+        "detailUrl": nullify(base.get("zlBidDetailLink") or row.get("zlBidDetailLink") or ""),
+        "originUrl": nullify(extract_origin_url(content)),
     }
     record["缺失项数"] = str(missing_fields_penalty(record))
     return record
@@ -350,13 +389,12 @@ def build_records(days: int = DEFAULT_DAYS, limit: int = DEFAULT_LIMIT, detail_l
     records = []
     for row in filtered[:detail_limit * 2]:
         uniq = row.get("uniqKey", "")
-        detail = row
-        try:
-            detail = get_bid_detail(uniq) if uniq else row
-        except Exception:
-            detail = row
         content = {}
-        records.append(merge_record(row, detail))
+        try:
+            content = get_bid_content(uniq) if uniq else {}
+        except Exception:
+            content = {}
+        records.append(merge_record(row, content))
 
     records.sort(key=lambda r: (r["相关度"] != "强相关", int(r["缺失项数"]), r["公告类型"] == "采购意向", r["发布时间"]), reverse=False)
     return records[:detail_limit]
@@ -383,7 +421,8 @@ def format_records(records: List[Dict[str, str]]) -> str:
             f"地址：{r['地址']}",
             f"联系人：{r['联系人']}",
             f"联系方式：{r['联系方式']}",
-            f"详情链接：{r['sourceUrl'] or '暂无'}",
+            f"详情链接：{r['detailUrl'] or '暂无'}",
+            f"原文链接：{r['originUrl'] or '暂无'}",
         ])
     return "\n".join(parts)
 
