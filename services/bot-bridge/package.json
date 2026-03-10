@@ -1,0 +1,12 @@
+{
+  "name": "bot-bridge-service",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Minimal bridge service for bot-to-bot relay with no external dependencies",
+  "main": "server-sqlite.js",
+  "scripts": {
+    "start": "node server-sqlite.js",
+    "start:json": "node server.js",
+    "start:sqlite": "node server-sqlite.js"
+  }
+}
